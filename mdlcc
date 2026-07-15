@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+from dataclasses import dataclass, field
+import itertools
+import sys
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    prev = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        curr = [i + 1]
+        for j, c2 in enumerate(s2):
+            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
+        prev = curr
+    return prev[-1]
+
+R  = '\033[0m'
+RED  = '\033[31m'
+GRAY = '\033[90m'
+YEL  = '\033[33m'
+
+@dataclass
+class SourceLocation:
+    file: str
+    line: int
+    column: int
+    text: str
+    end_column: int = None
+
+class CompileError(Exception):
+    def __init__(self, location: SourceLocation, message: str, suggestions: list[str] = None):
+        self.location = location
+        self.message = message
+        self.suggestions = suggestions or []
+        super().__init__(message)
+
+    def pretty(self) -> str:
+        loc = self.location
+        margin = f" {loc.line} | "          # видимая часть для расчёта отступа
+        pad = " " * len(margin)
+
+        start = loc.column - 1
+        length = (loc.end_column - loc.column) if loc.end_column and loc.end_column > loc.column else 1
+        caret = " " * (len(margin) + start) + RED + "^" + "~" * (length - 1) + R
+
+        lines = [
+            f"{GRAY}{loc.file}:{loc.line}:{loc.column}:{R} {RED}error:{R} {self.message}",
+            f"{GRAY}{margin}{R}{loc.text.rstrip()}",
+            caret,
+        ]
+        if self.suggestions:
+            hint = ", ".join(self.suggestions[:3])
+            lines.append(f"{pad}{YEL}hint: did you mean {hint}?{R}")
+
+        return "\n".join(lines)
+
+NONE, INPUT, OUTPUT, BLOCK = 0, 1, 2, 3
+STATE_NAMES = {
+    NONE:   "global scope (outside of any block)",
+    INPUT:  ".input section",
+    OUTPUT: ".output section",
+    BLOCK:  "instruction block",
+}
+
+@dataclass
+class InputField:
+    name: str; width: int; directive: str | None = None; offset: int = 0
+
+@dataclass
+class OutputField:
+    name: str; width: int; offset: int = 0
+
+@dataclass
+class Condition:
+    field: str; bit: int; invert: bool = False
+
+@dataclass
+class Signal:
+    name: str; location: SourceLocation; value: int = 1
+
+@dataclass
+class MicroInstruction:
+    signals:    list[Signal]    = field(default_factory=list)
+    conditions: list[Condition] = field(default_factory=list)
+    step: int = 0
+
+@dataclass
+class Block:
+    fixed_inputs: dict[str, int]         = field(default_factory=dict)
+    instructions: list[MicroInstruction] = field(default_factory=list)
+
+@dataclass
+class Program:
+    inputs:        dict[str, InputField]  = field(default_factory=dict)
+    outputs:       dict[str, OutputField] = field(default_factory=dict)
+    blocks:        list[Block]            = field(default_factory=list)
+    address_width: int = 0
+    output_width:  int = 0
+
+class Parser:
+    def __init__(self, filename: str):
+        self.program = Program()
+        self.state = NONE
+        self.current_block = None
+        self.current_step = 0
+        self.in_branch_block = False
+        self.filename = filename
+        self.errors: list[CompileError] = []
+
+    def _loc(self, lineno, col, text, end=None):
+        return SourceLocation(self.filename, lineno, col, text, end)
+
+    def _suggest(self, name, candidates):
+        ranked = sorted((levenshtein_distance(name, c), c) for c in candidates)
+        return [c for d, c in ranked[:3] if d <= 3]
+
+    def _err(self, *args, **kw):
+        self.errors.append(CompileError(*args, **kw))
+
+    def parse_input(self, line: str, lineno: int):
+        name_part = line.split()[0]
+        col = line.find(name_part) + 1
+        directive = line.split('@', 1)[1].strip().split()[0] if '@' in line else None
+
+        if '[' in name_part:
+            name, w = name_part.split('[')
+            try:    width = int(w.rstrip(']'))
+            except: self._err(self._loc(lineno, col, line), f"Invalid width in input declaration: {w}"); return
+        else:
+            name, width = name_part, 1
+
+        if name in self.program.inputs:
+            self._err(self._loc(lineno, col, line, col + len(name)), f"Duplicate input field '{name}'")
+        self.program.inputs[name] = InputField(name=name, width=width, directive=directive)
+
+    def parse_output(self, line: str, lineno: int):
+        name_part = line.split()[0]
+        col = line.find(name_part) + 1
+
+        if '[' in name_part:
+            name, w = name_part.split('[')
+            try:    width = int(w.rstrip(']'))
+            except: self._err(self._loc(lineno, col, line), "Invalid width in output declaration"); return
+        else:
+            name, width = name_part, 1
+
+        if name in self.program.outputs:
+            self._err(self._loc(lineno, col, line, col + len(name)), f"Duplicate output field '{name}'")
+        self.program.outputs[name] = OutputField(name=name, width=width)
+
+    def parse_condition(self, cond_str: str, full_line: str, lineno: int) -> Condition:
+        invert = cond_str.startswith('!')
+        s = cond_str[1:] if invert else cond_str
+        if '[' in s:
+            fname, b = s.split('[')
+            try:    bit = int(b.rstrip(']'))
+            except: self._err(self._loc(lineno, full_line.find(cond_str) + 1, full_line), "Invalid bit index in condition"); bit = 0
+        else:
+            fname, bit = s, 0
+        return Condition(field=fname, bit=bit, invert=invert)
+
+    def parse_instruction(self, line: str, lineno: int):
+        if not line.strip():
+            return
+        if self.current_block is None:
+            self._err(self._loc(lineno, 1, line),
+                "Instruction defined outside of active block. Set input values first (e.g., '.opcode 0x00')")
+            return
+
+        signals, conditions = [], []
+        for part in [p.strip() for p in line.split('|')]:
+            col_base = line.find(part) + 1 if part else 1
+            if '@' in part:
+                signal_part, cond_part = [x.strip() for x in part.split('@', 1)]
+                if cond_part:
+                    conditions.append(self.parse_condition(cond_part, line, lineno))
+            else:
+                signal_part = part
+
+            if signal_part:
+                if '=' in signal_part:
+                    try:
+                        name, val_str = [x.strip() for x in signal_part.split('=', 1)]
+                        value = int(val_str, 0)
+                    except ValueError:
+                        self._err(self._loc(lineno, col_base + signal_part.find('=') + 1, line), "Invalid value for signal")
+                        continue
+                else:
+                    name, value = signal_part, 1
+
+                idx = line.find(name, col_base - 1)
+                sc = (idx + 1) if idx != -1 else col_base
+                signals.append(Signal(name=name, value=value, location=self._loc(lineno, sc, line, sc + len(name))))
+
+        has_cond = bool(conditions)
+        if not has_cond and self.in_branch_block:
+            self.current_step += 1
+            self.in_branch_block = False
+
+        self.current_block.instructions.append(
+            MicroInstruction(signals=signals, conditions=conditions, step=self.current_step))
+
+        if not has_cond and not self.in_branch_block:
+            self.current_step += 1
+        elif has_cond:
+            self.in_branch_block = True
+
+    def parse_line(self, line: str, lineno: int):
+        original = line
+        line = line.split(";", 1)[0].strip()
+        if not line:
+            return
+
+        if line == ".input":  self.state = INPUT;  return
+        if line == ".output": self.state = OUTPUT; return
+        if line.startswith(".end"):
+            self.state, self.current_block, self.current_step, self.in_branch_block = NONE, None, 0, False
+            return
+
+        if line.startswith("."):
+            dname = line.split()[0][1:]
+            if dname in self.program.inputs:
+                parts = line.split()
+                if len(parts) < 2:
+                    self._err(self._loc(lineno, line.find(dname) + 1, original),
+                              f"Missing value for fixed input .{dname}"); return
+                try:    value = int(parts[1], 0)
+                except: self._err(self._loc(lineno, line.find(parts[1]) + 1, original),
+                                  f"Invalid integer value for .{dname}"); return
+
+                if self.current_block is None:
+                    self.current_block = Block()
+                    self.program.blocks.append(self.current_block)
+                    self.state = BLOCK
+
+                self.current_block.fixed_inputs[dname] = value
+                self.current_step = 0
+                self.in_branch_block = False
+            else:
+                col = line.find(dname) + 1
+                sugg = self._suggest(dname, list(self.program.inputs.keys()))
+                msg  = f"Unknown fixed input '.{dname}'"
+                if sugg: msg += f". Did you mean '.{sugg[0]}'?"
+                self._err(self._loc(lineno, col, original, col + len(dname)), msg, sugg)
+            return
+
+        if self.state == INPUT:  self.parse_input(original, lineno);       return
+        if self.state == OUTPUT: self.parse_output(original, lineno);      return
+        if self.state == BLOCK:  self.parse_instruction(original, lineno); return
+
+        col = len(original) - len(original.lstrip()) + 1
+        self._err(self._loc(lineno, col, original),
+                  f"Unexpected line in {STATE_NAMES.get(self.state, str(self.state))}")
+
+    def build_layout(self):
+        offset = 0
+        for f in reversed(list(self.program.inputs.values())):
+            f.offset = offset; offset += f.width
+        self.program.address_width = offset
+
+        offset = 0
+        for f in self.program.outputs.values():
+            f.offset = offset; offset += f.width
+        self.program.output_width = offset
+
+def encode_outputs(program: Program, inst: MicroInstruction, parser: Parser) -> int | None:
+    word, ok = 0, True
+    for sig in inst.signals:
+        if sig.name not in program.outputs:
+            parser._err(sig.location, f"Unknown output signal '{sig.name}'",
+                        parser._suggest(sig.name, list(program.outputs.keys())))
+            ok = False; continue
+
+        desc = program.outputs[sig.name]
+        if sig.value >= (1 << desc.width):
+            val_str = str(sig.value)
+            vp = sig.location.text.find(val_str, sig.location.column - 1)
+            loc = SourceLocation(sig.location.file, sig.location.line,
+                                 vp + 1, sig.location.text, vp + 1 + len(val_str)) if vp != -1 else sig.location
+            limit = (1 << desc.width) - 1
+            parser._err(loc, f"Value {sig.value} is too large for '{sig.name}' (max integer is {limit})")
+            ok = False; continue
+
+        word |= sig.value << desc.offset
+    return word if ok else None
+
+def encode_address(program: Program, values: dict) -> int:
+    addr = 0
+    for name, value in values.items():
+        if name in program.inputs:
+            addr |= value << program.inputs[name].offset
+    return addr
+
+def match_conditions(inst: MicroInstruction, input_values: dict) -> bool:
+    return all(
+        (((input_values.get(c.field, 0) >> c.bit) & 1) ^ c.invert) == 1
+        for c in inst.conditions
+    )
+
+def generate_rom(program: Program, parser: Parser) -> list[int] | None:
+    # validate all signals first
+    if any(encode_outputs(program, inst, parser) is None
+           for block in program.blocks for inst in block.instructions) or parser.errors:
+        return None
+
+    rom = [0] * (1 << program.address_width)
+    for block in program.blocks:
+        free   = [n for n in program.inputs if n not in block.fixed_inputs]
+        ranges = [range(1 << program.inputs[n].width) for n in free]
+        for inst in block.instructions:
+            for combo in itertools.product(*ranges):
+                vals = {**block.fixed_inputs, **dict(zip(free, combo))}
+                if match_conditions(inst, vals):
+                    rom[encode_address(program, vals)] = encode_outputs(program, inst, parser)
+    return rom
+
+def main():
+    if len(sys.argv) < 3:
+        print(f"Usage: python3 {sys.argv[0]} <input file> <output file>"); sys.exit(1)
+
+    input_file, output_file = sys.argv[1], sys.argv[2]
+    parser = Parser(input_file)
+
+    with open(input_file, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            parser.parse_line(line, lineno)
+
+    def die():
+        for e in parser.errors:
+            print(e.pretty(), file=sys.stderr)
+        sys.exit(1)
+
+    if parser.errors: die()
+
+    parser.build_layout()
+    rom = generate_rom(parser.program, parser)
+
+    if parser.errors or rom is None: die()
+
+    byte_width = (parser.program.output_width + 7) // 8
+    with open(output_file, "wb") as f:
+        for word in rom:
+            f.write(word.to_bytes(byte_width, byteorder="little"))
+
+if __name__ == "__main__":
+    main()

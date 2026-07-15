@@ -1,0 +1,40 @@
+.input
+    opcode[8]   ; Instruction Opcode (bits 13..6)
+    status[4]   ; CPU Status Flags (bits 5..2)
+    upc[2]      ; Microprogram Step Counter (bits 1..0)
+.end
+
+.output
+    pc_inc              ; Bit 0
+    a_in                ; Bit 1
+    alu_op[2]           ; Bits 3..2
+    upc_clr             ; Bit 4
+    mem_read            ; Bit 5
+    buf_write           ; Bit 6
+    buf_read            ; Bit 7
+    reg_a_write         ; Bit 8
+    alu_prepare         ; Bit 9
+    pc_inc_branch       ; Bit 10
+    branch_commit       ; Bit 11
+    alu_start           ; Bit 12
+    handle_zero         ; Bit 13
+    handle_carry        ; Bit 14
+    bus_poll            ; Bit 15
+    bus_acquire         ; Bit 16
+    bus_wait_state      ; Bit 17
+    bus_force_acquire   ; Bit 18
+    reg_a_out           ; Bit 19
+    alu_in_x            ; Bit 20
+    reg_b_out           ; Bit 21
+    alu_in_y            ; Bit 22
+    alu_out_write       ; Bit 23
+    reg_acc_write       ; Bit 24
+.end
+
+.opcde 0x10
+    ; Step 0 (upc = 0)
+    mem_read | buf_write
+    
+    ; Step 1 (upc = 1)
+    buf_read | reg_a_write | upc_clr
+.end

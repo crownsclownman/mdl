@@ -1,98 +1,212 @@
-# MDL (Microcode Description Language) Compiler
+# MDL (Microcode Description Language) Specification & User Guide
 
-A lightweight, hardware-agnostic compiler that translates a high-level microcode description file (`.mdl`) into a flat binary ROM image.
+Welcome to the official user guide and specification for the **MDL** microcode compiler.
 
-MDL allows you to define control store layouts dynamically and write microprograms with implicit step handling, automatic state expansion (Don't Care generation), and intuitive conditional branching.
-
----
-
-## Key Features
-
-* **Dynamic Address Space Layout:** No hardcoded fields. The entire ROM address space is defined by the `.input` section and mapped dynamically.
-* ~~**Implicit Microstep Counter:** Automatically tracks execution steps using any input field annotated with `@step`.~~ Temporarily removed.
-* **Zero-Overhead Branching:** Conditional lines (annotated with `@field[bit]`) are grouped into the same physical microstep, eliminating the need to manually manage hardware step-counter offsets.
-* **Smart State Expansion:** Automatically duplicates unconditional microinstructions across all untargeted status configurations, while precisely masking targeted branches (handling "Don't Care" bits natively).
-* **Dynamic Field Bindings:** Any declared input field can serve as a block directive (e.g., `.opcode 0x01` or `.status 0x08`), eliminating hardcoded compiler rules.
+This document will help you master the syntax of the `mdlcc` compiler, understand the architectural principles of ROM generation, and design efficient control logic for your custom CPU.
 
 ---
 
-## MDL File Anatomy
+## Table of Contents
 
-An MDL file consists of three main parts: **Inputs**, **Outputs**, and **Blocks**.
+1. [Introduction to MDL](https://www.google.com/search?q=%231-introduction-to-mdl)
+2. [Anatomy of an MDL File](https://www.google.com/search?q=%232-anatomy-of-an-mdl-file)
+3. [The Input Declaration Section (.input)](https://www.google.com/search?q=%233-the-input-declaration-section-input)
+4. [The Output Declaration Section (.output)](https://www.google.com/search?q=%234-the-output-declaration-section-output)
+5. [Branching and Conditional Execution Rules (@)](https://www.google.com/search?q=%235-branching-and-conditional-execution-rules-)
+6. [Microcode Pattern Encyclopedia (Gallery of Real-World Examples)](https://www.google.com/search?q=%236-microcode-pattern-encyclopedia-gallery-of-real-world-examples)
 
-### 1. The `.input` Section (ROM Address)
+---
 
-Defines the structure of the ROM address lines from **MSB to LSB**.
+## 1. Introduction to MDL
 
-```mdl
+**MDL** is a domain-specific language (DSL) designed to compile high-level microprogram descriptions into finished, raw binary ROM images.
+
+The primary goal of the `mdlcc` compiler is to eliminate the tedious process of manually calculating control logic look-up tables (LUTs) for your CPU. You define which signals must be asserted on each microstep of an instruction, and the compiler automatically:
+
+* Computes the ROM address mapping.
+* Duplicates shared microsteps across all unused flag combinations.
+* Validates signal value widths to prevent overflows.
+* Suggests correct signal names using Levenshtein distance when you make typos.
+
+---
+
+## 2. Anatomy of an MDL File
+
+Every MDL source file has a strict layout consisting of three logical blocks:
+
+```text
+; --- BLOCK 1: INPUTS (ROM ADDRESS SHAPE) ---
 .input
-    opcode[8]    ; Most Significant Bits (bits 13..6)
-    status[4]    ; Branch condition flags (bits 5..2)
-    upc[2] @step ; Microstep counter (bits 1..0)
+    ...
 .end
 
-```
-
-### 2. The `.output` Section (Control Signals)
-
-Defines the output control word of the ROM. Fields can be single-bit signals or multi-bit buses.
-
-```mdl
+; --- BLOCK 2: OUTPUTS (ROM DATA WORD) ---
 .output
-    pc_inc      ; Bit 0
-    a_in        ; Bit 1
-    alu_op[2]   ; Bits 3..2
-    upc_clr     ; Bit 4
+    ...
+.end
+
+; --- BLOCK 3: MICROPROGRAMS (BLOCKS) ---
+.opcode 0x00
+    ...
+.opcode 0x01
+    ...
+
+```
+
+---
+
+## 3. The Input Declaration Section (`.input`)
+
+This section defines how the physical address bus of your control unit ROM is mapped to internal CPU state registers.
+
+> ⚠️ **Deprecation Notice:** The `@step` flag is **deprecated**. The hardware microstep counter is now identified implicitly by its position in the address space. By default, it resides in the least significant bits to optimize ROM address boundaries.
+
+### Input Configuration Example (14-bit Address Space):
+
+```text
+.input
+    opcode[8]   ; Instruction Opcode (bits 13..6) — sets the base instruction offset
+    status[4]   ; CPU Status Flags (bits 5..2) — used for conditional transitions
+    upc[2]      ; Microprogram Step Counter (bits 1..0) — incremented by hardware clock
 .end
 
 ```
 
-### 3. The Instruction Blocks
+In this setup, the compiler generates a ROM with a total size of $2^{14} = 16384$ words.
 
-Blocks are declared using `.<input_field> <value>`. The compiler automatically manages step progression:
+---
 
-```mdl
-.opcode 0x00
-    ; Step 0: Executed unconditionally (cloned to all 16 'status' combinations)
-    pc_inc | a_in | alu_op=2
+## 4. The Output Declaration Section (`.output`)
 
-    ; Step 1: Branching
-    ; Both lines execute at Step 1. The compiler maps them to different ROM areas.
-    alu_op=3 @status[0]          ; Active when status[0] is 1
-    alu_op=0 | pc_inc @!status[0] ; Active when status[0] is 0
+This section defines the structure of your ROM's data word (the control signals). Each control signal reserves a fixed bit slice of the output.
 
-    ; Step 2: Convergence
-    ; Unconditional line. The step counter automatically increments after a branch.
-    a_in | upc_clr
-.end 0x00
+```text
+.output
+    pc_inc      ; Offset 0: Increment Program Counter (1 bit)
+    a_in        ; Offset 1: Write to Register A (1 bit)
+    alu_op[2]   ; Offset 3..2: ALU Operation Select (2-bit field, values 0 to 3)
+    upc_clr     ; Offset 4: Reset Microstep Counter (1 bit)
+.end
 
 ```
 
 ---
 
-## Address Resolution & Compilation Logic
+## 5. Branching and Conditional Execution Rules (`@`)
 
-The compiler builds the ROM address map by multiplying the defined input field widths. For the anatomy example above, the ROM size is $2^{14} = 16384$ bytes.
+MDL syntax allows you to conditionally assert control signals based on status bits (such as ALU flags declared in the `status` input field).
 
-When generating the ROM:
+To execute a signal conditionally on a specific microstep, use the `@` operator:
 
-1. **Unconditional steps** (like Step 0) are duplicated across all combinations of the unconstrained `status` field.
-2. **Conditional steps** (like Step 1) evaluate the `@` mask. Only matching addresses are populated with the specified control signals.
-3. **Sequential progression** is enforced. The compiler ensures step limits are validated to prevent address overlapping (aliasing).
+* `signal @ flag[index]` — active only if the specified status bit is **1**.
+* `signal @ !flag[index]` — active only if the specified status bit is **0**.
+
+```text
+; Example: On Step 1, pc_inc is asserted only if bit 0 of the status field is 1
+pc_inc @ status[0]
+
+```
 
 ---
 
-## Getting Started
+## 6. Microcode Pattern Encyclopedia (Gallery of Real-World Examples)
 
-### Prerequisites
+These practical design patterns demonstrate how to implement various CPU instructions using MDL.
 
-* Python 3.10 or higher
+### Pattern 1: Simple Linear Instruction (No Branching)
 
-### Compilation
+A classic example of a simple register-to-register operation executing over a fixed number of clock cycles.
 
-Run the compiler by passing your MDL source file as an argument:
+```text
+.opcode 0x10
+    ; Step 0: Read memory location into temporary buffer register
+    mem_read | buf_write
+    
+    ; Step 1: Transfer data from buffer to destination Register A and reset step
+    buf_read | reg_a_write | upc_clr
 
-```bash
-python3 mdlcc.py my_microcode.mdl output.bin
+```
+
+---
+
+### Pattern 2: Conditional Jump (IF-ELSE Branching)
+
+Splitting execution logic based on status flags (e.g., negative or overflow bit).
+
+```text
+.opcode 0x20
+    ; Step 0: Prepare ALU operand pipeline unconditionally
+    alu_prepare
+    
+    ; Step 1: Branch depending on sign flag (status[3])
+    ; If sign is negative (1): Prepare the branch target address
+    pc_inc_branch @ status[3]
+    ; Else (0): Reset step counter early to end execution
+    upc_clr       @ !status[3]
+    
+    ; Step 2: Branch Commit. Executed only if we followed the IF path
+    branch_commit | upc_clr
+
+```
+
+---
+
+### Pattern 3: Multi-Flag Branching (Parallel Conditions)
+
+MDL allows evaluating different status bits on the exact same microstep.
+
+```text
+.opcode 0x30
+    ; Step 0: Start computation
+    alu_start
+    
+    ; Step 1: Evaluate Zero flag (status[0]) and Carry flag (status[1]) concurrently
+    handle_zero  @ status[0]
+    handle_carry @ status[1]
+    
+    ; Step 2: Finalize step execution
+    upc_clr
+
+```
+
+---
+
+### Pattern 4: Early Termination Pattern (Step Optimization)
+
+If an execution condition is met early, we reset the sequence immediately to save precious clock cycles.
+
+```text
+.opcode 0x40
+    ; Step 0: Poll system bus status
+    bus_poll
+    
+    ; Step 1: If bus is free (status[2] == 1), acquire it and exit microprogram immediately
+    upc_clr @ status[2] | bus_acquire @ status[2]
+    
+    ; Step 2: Code execution reaches here only if bus was busy (status[2] == 0)
+    bus_wait_state
+    
+    ; Step 3: Wait loop complete, force acquisition of bus and exit
+    bus_force_acquire | upc_clr
+
+```
+
+---
+
+### Pattern 5: Multi-Bit ALU Operation
+
+How to write commands using multi-bit control fields (like our 2-bit `alu_op` signal).
+
+```text
+.opcode 0x50
+    ; Step 0: Output source registers onto internal buses
+    reg_a_out | alu_in_x
+    reg_b_out | alu_in_y
+    
+    ; Step 1: Assert addition operation on ALU (alu_op = 2)
+    alu_op=2 | alu_out_write
+    
+    ; Step 2: Write calculation result into accumulator and reset step counter
+    reg_acc_write | upc_clr
 
 ```

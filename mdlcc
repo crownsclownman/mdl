@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from dataclasses import dataclass, field
+from pathlib import Path
 import itertools
 import sys
+import re
 
 def levenshtein_distance(s1: str, s2: str) -> int:
     if len(s1) < len(s2):
@@ -82,32 +84,35 @@ class Signal:
 
 @dataclass
 class MicroInstruction:
-    signals:    list[Signal]    = field(default_factory=list)
-    conditions: list[Condition] = field(default_factory=list)
+    signals:    list[Signal]        = field(default_factory=list)
+    conditions: list[Condition]     = field(default_factory=list)
     step: int = 0
 
 @dataclass
 class Block:
-    fixed_inputs: dict[str, int]         = field(default_factory=dict)
-    instructions: list[MicroInstruction] = field(default_factory=list)
+    fixed_inputs: dict[str, int]            = field(default_factory=dict)
+    instructions: list[MicroInstruction]    = field(default_factory=list)
 
 @dataclass
 class Program:
-    inputs:        dict[str, InputField]  = field(default_factory=dict)
-    outputs:       dict[str, OutputField] = field(default_factory=dict)
-    blocks:        list[Block]            = field(default_factory=list)
-    address_width: int = 0
-    output_width:  int = 0
+    inputs:         dict[str, InputField]   = field(default_factory=dict)
+    outputs:        dict[str, OutputField]  = field(default_factory=dict)
+    blocks:         list[Block]             = field(default_factory=list)
+    consts:      dict[str, list[Signal]] = field(default_factory=dict)
+    address_width:  int = 0
+    output_width:   int = 0
 
 class Parser:
-    def __init__(self, filename: str):
+    def __init__(self, filename: str, base_dir: Path | None = None ):
         self.program = Program()
         self.state = NONE
         self.current_block = None
         self.current_step = 0
         self.in_branch_block = False
         self.filename = filename
+        self.base_dir = base_dir or Path(filename).parent
         self.errors: list[CompileError] = []
+        self.processed_files = set()
 
     def _loc(self, lineno, col, text, end=None):
         return SourceLocation(self.filename, lineno, col, text, end)
@@ -118,6 +123,43 @@ class Parser:
 
     def _err(self, *args, **kw):
         self.errors.append(CompileError(*args, **kw))
+
+    def parse_const(self, line: str, lineno: int):
+        # const name = this is all a single string
+        match = re.match(r'const\s+(\w+)\s*=\s*\((.*)\)', line)
+        if not match:
+            self._err(self._loc(lineno, 1, line), "Invalid const syntax. Use: const NAME = (signal | signal | ...)")
+            return
+
+        name = match.group(1)
+        signals_str = match.group(2)
+
+        if name in self.program.consts:
+            col = line.find(name) + 1
+            self._err(self._loc(lineno, col, line, col + len(name)), f"Duplicate const '{name}'")
+            return
+
+        signals = []
+        for sig_part in signals_str.split('|'):
+            sig_part = sig_part.strip()
+            if not sig_part:
+                continue
+
+            col_base = line.find(sig_part) + 1
+            if '=' in sig_part:
+                try:
+                    sname, val_str = [x.strip() for x in sig_part.split('=', 1)]
+                    value = int(val_str, 0)
+                except ValueError:
+                    self._err(self._loc(lineno, col_base, line), "Invalid value in const signal")
+                    return
+            else:
+                sname, value = sig_part, 1
+
+            idx = line.find(sname, col_base - 1)
+            sc = (idx - 1) if idx != -1 else col_base
+            signals.append(Signal(name=sname, value=value, location=self._loc(lineno, sc, line, sc+len(sname))))
+        self.program.consts[name] = signals
 
     def parse_input(self, line: str, lineno: int):
         name_part = line.split()[0]
@@ -180,7 +222,16 @@ class Parser:
                 signal_part = part
 
             if signal_part:
-                if '=' in signal_part:
+                if signal_part.startswith('$'):
+                    const_name = signal_part[1:]
+                    if const_name not in self.program.consts:
+                        col = line.find(signal_part) + 1
+                        self._err(self._loc(lineno, col, line, col + len(signal_part)),
+                                  f"Unknown const '{const_name}'",
+                                  self._suggest(const_name, list(self.program.consts.keys())))
+                        continue
+                    signals.extend(self.program.consts[const_name])
+                elif '=' in signal_part:
                     try:
                         name, val_str = [x.strip() for x in signal_part.split('=', 1)]
                         value = int(val_str, 0)
@@ -189,10 +240,9 @@ class Parser:
                         continue
                 else:
                     name, value = signal_part, 1
-
-                idx = line.find(name, col_base - 1)
-                sc = (idx + 1) if idx != -1 else col_base
-                signals.append(Signal(name=name, value=value, location=self._loc(lineno, sc, line, sc + len(name))))
+                    idx = line.find(name, col_base - 1)
+                    sc = (idx + 1) if idx != -1 else col_base
+                    signals.append(Signal(name=name, value=value, location=self._loc(lineno, sc, line, sc + len(name))))
 
         has_cond = bool(conditions)
         if not has_cond and self.in_branch_block:
@@ -207,16 +257,67 @@ class Parser:
         elif has_cond:
             self.in_branch_block = True
 
+    def process_include(self, line: str, lineno: int):
+        match = re.match(r'#include\s+"([^"]+)"', line)
+        if not match:
+            self._err(self._loc(lineno, 1, line), 'Invalid include syntax. Use: #include "file.mdl"')
+            return
+
+        inc_file = match.group(1)
+        inc_path = self.base_dir / inc_file
+
+        if not inc_path.exists():
+            self._err(self._loc(lineno, 1, line), f"Include file not found: {inc_file}")
+            return
+
+        inc_path_str = str(inc_path.resolve())
+        if inc_path_str in self.processed_files:
+            self._err(self._loc(lineno, 1, line), f"Circular include detected: {inc_file}")
+            return
+
+        self.processed_files.add(inc_path_str)
+        sub_parser = Parser(inc_file, self.base_dir)
+        sub_parser.processed_files = self.processed_files
+        sub_parser.state = self.state
+        sub_parser.current_block = self.current_block
+        sub_parser.current_step = self.current_step
+        sub_parser.in_branch_block = self.in_branch_block
+
+        with open(inc_path, encoding="utf-8") as f:
+            for sub_lineno, sub_line in enumerate(f, 1):
+                sub_parser.parse_line(sub_line, sub_lineno)
+
+        # Merge parsed data
+        self.program.inputs.update(sub_parser.program.inputs)
+        self.program.outputs.update(sub_parser.program.outputs)
+        self.program.consts.update(sub_parser.program.consts)
+        self.program.blocks.extend(sub_parser.program.blocks)
+        self.errors.extend(sub_parser.errors)
+        self.processed_files = sub_parser.processed_files
+
+        self.state = sub_parser.state
+        self.current_block = sub_parser.current_block
+        self.current_step = sub_parser.current_step
+        self.in_branch_block = sub_parser.in_branch_block
+
     def parse_line(self, line: str, lineno: int):
         original = line
         line = line.split(";", 1)[0].strip()
         if not line:
             return
 
-        if line == ".input":  self.state = INPUT;  return
-        if line == ".output": self.state = OUTPUT; return
+        if line.startswith("#include"):
+            self.process_include(original, lineno)
+            return
+
+        if line == ".input":            self.state = INPUT;     return
+        if line == ".output":           self.state = OUTPUT;    return
         if line.startswith(".end"):
             self.state, self.current_block, self.current_step, self.in_branch_block = NONE, None, 0, False
+            return
+
+        if line.startswith('const '):
+            self.parse_const(original, lineno)
             return
 
         if line.startswith("."):
@@ -226,9 +327,13 @@ class Parser:
                 if len(parts) < 2:
                     self._err(self._loc(lineno, line.find(dname) + 1, original),
                               f"Missing value for fixed input .{dname}"); return
-                try:    value = int(parts[1], 0)
-                except: self._err(self._loc(lineno, line.find(parts[1]) + 1, original),
-                                  f"Invalid integer value for .{dname}"); return
+                value_str = parts[1]
+                if value_str == "*":
+                    value = "*"
+                else:
+                    try:    value = int(parts[1], 0)
+                    except: self._err(self._loc(lineno, line.find(parts[1]) + 1, original),
+                                      f"Invalid integer value for .{dname}"); return
 
                 if self.current_block is None:
                     self.current_block = Block()
@@ -246,9 +351,9 @@ class Parser:
                 self._err(self._loc(lineno, col, original, col + len(dname)), msg, sugg)
             return
 
-        if self.state == INPUT:  self.parse_input(original, lineno);       return
-        if self.state == OUTPUT: self.parse_output(original, lineno);      return
-        if self.state == BLOCK:  self.parse_instruction(original, lineno); return
+        if self.state == INPUT:     self.parse_input(original, lineno);         return
+        if self.state == OUTPUT:    self.parse_output(original, lineno);        return
+        if self.state == BLOCK:     self.parse_instruction(original, lineno);   return
 
         col = len(original) - len(original.lstrip()) + 1
         self._err(self._loc(lineno, col, original),
@@ -299,21 +404,40 @@ def match_conditions(inst: MicroInstruction, input_values: dict) -> bool:
         for c in inst.conditions
     )
 
+def expand_wildcards(fixed_inputs: dict, program: Program) -> list[dict]:
+    wildcards = [(k,v) for k,v in fixed_inputs.items() if v == "*"]
+    fixed = {k: v for k,v in fixed_inputs.items() if v != "*"}
+
+    if not wildcards:
+        return [fixed]
+
+    expansions = []
+    wildcard_names = [k for k, _ in wildcards]
+    ranges = [range(1 << program.inputs[k].width) for k in wildcard_names]
+
+    for combo in itertools.product(*ranges):
+        expanded = {**fixed, **dict(zip(wildcard_names, combo))}
+        expansions.append(expanded)
+
+    return expansions
+
 def generate_rom(program: Program, parser: Parser) -> list[int] | None:
-    # validate all signals first
     if any(encode_outputs(program, inst, parser) is None
            for block in program.blocks for inst in block.instructions) or parser.errors:
         return None
 
     rom = [0] * (1 << program.address_width)
     for block in program.blocks:
-        free   = [n for n in program.inputs if n not in block.fixed_inputs]
-        ranges = [range(1 << program.inputs[n].width) for n in free]
-        for inst in block.instructions:
-            for combo in itertools.product(*ranges):
-                vals = {**block.fixed_inputs, **dict(zip(free, combo))}
-                if match_conditions(inst, vals):
-                    rom[encode_address(program, vals)] = encode_outputs(program, inst, parser)
+        expanded_fixed = expand_wildcards(block.fixed_inputs, program)
+
+        for fixed_vals in expanded_fixed:
+            free   = [n for n in program.inputs if n not in fixed_vals]
+            ranges = [range(1 << program.inputs[n].width) for n in free]
+            for inst in block.instructions:
+                for combo in itertools.product(*ranges):
+                    vals = {**fixed_vals, **dict(zip(free, combo))}
+                    if match_conditions(inst, vals):
+                        rom[encode_address(program, vals)] = encode_outputs(program, inst, parser)
     return rom
 
 def main():

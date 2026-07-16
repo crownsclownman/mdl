@@ -370,17 +370,17 @@ python3 mdlcc input.mdl output.bin
 
 **Basic binary output:**
 ```bash
-./mdlcc microcode.mdl microcode.bin
+mdlcc microcode.mdl microcode.bin
 ```
 
 **Verilog module for simulation:**
 ```bash
-./mdlcc microcode.mdl control_rom.v --format verilog --verilog-name control
+mdlcc microcode.mdl control_rom.v --format verilog --verilog-name control
 ```
 
 **Split for dual-port RAM:**
 ```bash
-./mdlcc microcode.mdl rom --format bin --split 8
+mdlcc microcode.mdl rom --format bin --split 8
 ```
 
 ### Error Handling
@@ -393,6 +393,17 @@ myprogram.mdl:15:9: error: Unknown output signal 'ctrl_sig'
             ^~~~~~~
 hint: did you mean ctrl, ctrl_en?
 ```
+
+## Installation
+
+### Linux/macOS
+```bash
+curl -sSL https://raw.githubusercontent.com/crownsclownman/mdl/main/install.sh | sudo bash
+```
+
+## Manual Installation
+
+to be done.......
 
 ---
 

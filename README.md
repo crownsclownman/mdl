@@ -29,12 +29,14 @@ Defines the structure of the ROM address lines from **MSB to LSB**. Each field d
 ```mdl
 .input
     opcode[8]    ; Instruction opcode (8 bits)
-    status[4]    ; Condition flags ZNCV (4 bits)
-    upc[2]       ; Microprogram counter (2 bits)
+    z            ; Zero flag (1 bit)
+    n            ; Negative flag (1 bit)
+    c            ; Carry flag (1 bit)
+    v            ; Overflow flag (1 bit)
 .end
 ```
 
-This creates a ROM with **14-bit addressing** (2^14 = 16384 locations).
+This creates a ROM with **12-bit addressing** (2^12 = 4096 locations).
 
 ### 2. The `.output` Section (Control Signals)
 
@@ -49,7 +51,7 @@ Defines the control signals that form the ROM data word. Signals can be single-b
 .end
 ```
 
-### 3. Constants (Optional)
+### Constants (Optional)
 
 Define reusable patterns of signals using `const NAME = (...)`.
 
@@ -70,8 +72,8 @@ Blocks partition the ROM and are declared using `.<input_field> <value>`. The co
     ; Step 0: Executed for all combinations of free inputs
     $fetch
     ; Step 1: Conditional branching
-    pc_inc | alu_op=3 @status[2]      ; Execute if status[2] (overflow flag) = 1
-    alu_op=0 @!status[2]               ; Execute if status[2] = 0
+    pc_inc | alu_op=3 @z      ; Execute if z (zero flag) = 1
+    alu_op=0 @!z              ; Execute if z = 0
     ; Step 2: Convergence
     reg_write
 .end
@@ -81,9 +83,22 @@ Blocks partition the ROM and are declared using `.<input_field> <value>`. The co
     $halt
 .end
 
-.status 0b1000
-    ; Only when zero flag is set
+.z 1
+.v 1
+    ; Only when both zero AND overflow flags are set
     $store | mem_write
+.end
+
+.opcode 0x50
+    ; Numeric comparisons
+    result=1 @counter<10
+    result=2 @counter>=10
+.end
+
+.opcode 0x60
+    ; Inequality checks
+    do_store @status!=0
+    do_halt @status=0
 .end
 ```
 
@@ -96,8 +111,8 @@ Blocks partition the ROM and are declared using `.<input_field> <value>`. The co
 Inputs are mapped to ROM address bits from **least significant to most significant**:
 
 ```
-Address = upc | (status << 2) | (opcode << 6)
-          [1:0]  [5:2]          [13:6]
+Address = z | (n << 1) | (c << 2) | (v << 3) | (opcode << 4)
+          [0]  [1]         [2]         [3]         [11:4]
 ```
 
 ### Step Execution & Branching
@@ -105,7 +120,7 @@ Address = upc | (status << 2) | (opcode << 6)
 Within a block, the compiler tracks **microsteps** automatically:
 
 1. **Unconditional lines** execute at the current step and advance it
-2. **Conditional lines** (marked with `@condition`) execute at the same step they form branches
+2. **Conditional lines** (marked with `@condition`) execute at the same step-they form branches
 3. After any conditional line, the step counter advances
 
 Example:
@@ -228,6 +243,16 @@ instruction @!field[bit]  ; Invert condition with !
 ```mdl
 @field[bit]       ; True if field[bit] == 1
 @!field[bit]      ; True if field[bit] == 0
+
+@field            ; True if field != 0 (for 1-bit fields)
+@!field           ; True if field == 0
+
+@field=value      ; True if field == value (numeric comparison)
+@field!=value     ; True if field != value
+@field<value      ; True if field < value
+@field<=value     ; True if field <= value
+@field>value      ; True if field > value
+@field>=value     ; True if field >= value
 ```
 
 ### Comments
@@ -276,6 +301,55 @@ const add_with_carry = (alu_fn=0 | carry_out)
 
 ---
 
+## Output Formats
+
+The compiler supports multiple output formats via the `--format` flag:
+
+### Binary (default)
+```bash
+./mdlcc input.mdl output.bin --format bin
+```
+Raw binary file, one word per address.
+
+### Raw Hex
+```bash
+./mdlcc input.mdl output.hex --format hex
+```
+Hexadecimal values, one per line. Useful for simulations.
+
+### Intel HEX
+```bash
+./mdlcc input.mdl output.hex --format hex-intel
+```
+Standard Intel HEX format. Compatible with many FPGA tools.
+
+### Verilog Memory Init
+```bash
+./mdlcc input.mdl rom.mem --format verilog-mem
+```
+Plain hex suitable for `readmemh()` in Verilog.
+
+### Verilog Module
+```bash
+./mdlcc input.mdl rom.v --format verilog --verilog-name alu_rom
+```
+Complete Verilog module with memory initialization.
+
+## ROM Splitting
+
+For wide ROM outputs, split into multiple files (one per byte):
+
+```bash
+./mdlcc input.mdl rom.bin --split 8   # Create rom_0.bin, rom_1.bin, rom_2.bin...
+./mdlcc input.mdl rom.bin --split 16  # Split into 16-bit chunks (2 files)
+./mdlcc input.mdl rom.bin --split 24  # Split into 24-bit chunks (3 files)
+./mdlcc input.mdl rom.bin --split 32  # Split into 32-bit chunks (4 files)
+```
+
+Split width must be a multiple of 8. Each chunk becomes a separate file: `rom_0.bin`, `rom_1.bin`, etc.
+
+---
+
 ## Getting Started
 
 ### Prerequisites
@@ -290,6 +364,23 @@ chmod +x mdlcc
 Or:
 ```bash
 python3 mdlcc input.mdl output.bin
+```
+
+### Quick Examples
+
+**Basic binary output:**
+```bash
+./mdlcc microcode.mdl microcode.bin
+```
+
+**Verilog module for simulation:**
+```bash
+./mdlcc microcode.mdl control_rom.v --format verilog --verilog-name control
+```
+
+**Split for dual-port RAM:**
+```bash
+./mdlcc microcode.mdl rom --format bin --split 8
 ```
 
 ### Error Handling

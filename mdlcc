@@ -4,6 +4,7 @@ from pathlib import Path
 import itertools
 import sys
 import re
+import argparse
 
 def levenshtein_distance(s1: str, s2: str) -> int:
     if len(s1) < len(s2):
@@ -40,7 +41,7 @@ class CompileError(Exception):
 
     def pretty(self) -> str:
         loc = self.location
-        margin = f" {loc.line} | "          # видимая часть для расчёта отступа
+        margin = f" {loc.line} | "
         pad = " " * len(margin)
 
         start = loc.column - 1
@@ -66,6 +67,8 @@ STATE_NAMES = {
     BLOCK:  "instruction block",
 }
 
+COND_BIT, COND_EQ, COND_NE, COND_LT, COND_GT, COND_LE, COND_GE = 0, 1, 2, 3, 4, 5, 6
+
 @dataclass
 class InputField:
     name: str; width: int; directive: str | None = None; offset: int = 0
@@ -76,7 +79,11 @@ class OutputField:
 
 @dataclass
 class Condition:
-    field: str; bit: int; invert: bool = False
+    field: str
+    cond_type: int = COND_BIT
+    bit: int = 0
+    value: int = 0
+    invert: bool = False
 
 @dataclass
 class Signal:
@@ -125,7 +132,6 @@ class Parser:
         self.errors.append(CompileError(*args, **kw))
 
     def parse_const(self, line: str, lineno: int):
-        # const name = this is all a single string
         match = re.match(r'const\s+(\w+)\s*=\s*\((.*)\)', line)
         if not match:
             self._err(self._loc(lineno, 1, line), "Invalid const syntax. Use: const NAME = (signal | signal | ...)")
@@ -193,15 +199,45 @@ class Parser:
         self.program.outputs[name] = OutputField(name=name, width=width)
 
     def parse_condition(self, cond_str: str, full_line: str, lineno: int) -> Condition:
+        col = full_line.find(cond_str)
         invert = cond_str.startswith('!')
         s = cond_str[1:] if invert else cond_str
+
+        for op in ['!=', '<=', '>=', '==', '=', '<', '>']:
+            for op in s:
+                fname, val_str = s.split(op, 1)
+                fname = fname.strip()
+                val_str = val_str.strip()
+
+                try:
+                    value = int(val_str, 0)
+                except ValueError:
+                    self._err(self._loc(lineno, col, full_line), f"Invalid condition value: {val_str}")
+                    return Condition(field=fname)
+
+                # COND_BIT, COND_EQ, COND_NE, COND_LT, COND_GT, COND_LE, COND_GE = 0, 1, 2, 3, 4, 5, 6
+
+                op_map = {
+                        '=': COND_EQ, '==': COND_EQ,
+                        '!=': COND_NE,
+                        '<': COND_LT, '<=': COND_LE,
+                        '>': COND_GT, '>=': COND_GE
+                }
+                cond_type = op_map.get(op, COND_EQ)
+                return Condition(field=fname, cond_type=cond_type, value=value)
+
         if '[' in s:
             fname, b = s.split('[')
-            try:    bit = int(b.rstrip(']'))
-            except: self._err(self._loc(lineno, full_line.find(cond_str) + 1, full_line), "Invalid bit index in condition"); bit = 0
+            fname = fname.strip()
+            try:
+                bit = int(b.rstrip(']'))
+            except ValueError:
+                self._err(self._loc(lineno, col, full_line), "Invalid bit index")
+                return Condition(field=fname)
+            return Condition(field=fname, cond_type=COND_BIT, bit=bit, invert=invert)
         else:
-            fname, bit = s, 0
-        return Condition(field=fname, bit=bit, invert=invert)
+            fname = s.strip()
+            return Condition(field=fname, cond_type=COND_BIT, bit=0, invert=invert)
 
     def parse_instruction(self, line: str, lineno: int):
         if not line.strip():
@@ -399,10 +435,27 @@ def encode_address(program: Program, values: dict) -> int:
     return addr
 
 def match_conditions(inst: MicroInstruction, input_values: dict) -> bool:
-    return all(
-        (((input_values.get(c.field, 0) >> c.bit) & 1) ^ c.invert) == 1
-        for c in inst.conditions
-    )
+    for c in inst.conditions:
+        val = input_values.get(c.field, 0)
+
+        if c.cond_type == COND_BIT:
+            bit = (val >> c.bit) & 1
+            if c.invert: bit = 1 - bit
+            if bit == 0: return False
+        elif c.cond_type == COND_EQ:
+            if val != c.value: return False
+        elif c.cond_type == COND_NE:
+            if val == c.value: return False
+        elif c.cond_type == COND_LT:
+            if val >= c.value: return False
+        elif c.cond_type == COND_LE:
+            if val > c.value: return False
+        elif c.cond_type == COND_GT:
+            if val <= c.value: return False
+        elif c.cond_type == COND_GE:
+            if val < c.value: return False
+
+    return True
 
 def expand_wildcards(fixed_inputs: dict, program: Program) -> list[dict]:
     wildcards = [(k,v) for k,v in fixed_inputs.items() if v == "*"]
@@ -427,7 +480,10 @@ def generate_rom(program: Program, parser: Parser) -> list[int] | None:
         return None
 
     rom = [0] * (1 << program.address_width)
+    filled_addrs = set()
+
     for block in program.blocks:
+        has_wildcard = any(v == "*" for v in block.fixed_inputs.values())
         expanded_fixed = expand_wildcards(block.fixed_inputs, program)
 
         for fixed_vals in expanded_fixed:
@@ -440,11 +496,100 @@ def generate_rom(program: Program, parser: Parser) -> list[int] | None:
                         rom[encode_address(program, vals)] = encode_outputs(program, inst, parser)
     return rom
 
-def main():
-    if len(sys.argv) < 3:
-        print(f"Usage: python3 {sys.argv[0]} <input file> <output file>"); sys.exit(1)
+def save_bin(rom: list[int], path: str, byte_width: int):
+    with open(path, "wb") as f:
+        for word in rom:
+            f.write(word.to_bytes(byte_width, byteorder="little"))
 
-    input_file, output_file = sys.argv[1], sys.argv[2]
+def save_hex_raw(rom: list[int], path: str, byte_width: int):
+    with open(path, "w") as f:
+        for word in rom:
+            f.write(f"{word:0{byte_width*2}x}\n")
+
+def create_hex_record(address, data):
+    byte_count = len(data)
+    record_type = 0x00  # Data record
+    checksum_calc = (byte_count + (address >> 8) + (address & 0xFF) + record_type + sum(data)) % 256
+    checksum = (256 - checksum_calc) % 256
+    hex_string = f":{byte_count:02X}{address:04X}{record_type:02X}"
+    for byte in data:
+        hex_string += f"{byte:02X}"
+    hex_string += f"{checksum:02X}\n"
+    return hex_string
+
+def save_hex_intel(rom: list[int], path: str, byte_width: int, record_len: int = 16):
+    all_bytes = []
+    for word in rom:
+        all_bytes.extend(word.to_bytes(byte_width, byteorder="little"))
+
+    with open(path, "w") as f:
+        f.write(":020000040000F8\n")
+
+        addr = 0
+        for i in range(0, len(all_bytes), record_len):
+            chunk = all_bytes[i : i + record_len]
+            f.write(create_hex_record(addr, chunk))
+            addr += len(chunk)
+
+        f.write(":00000001FF\n")
+
+def save_verilog_mem(rom: list[int], path: str, byte_width: int, mem_name: str = "rom"):
+    save_hex_raw(rom, path, byte_width)
+
+def save_verilog_init(rom: list[int], path: str, byte_width: int, mem_name: str = "rom"):
+    addr_bits = (len(rom) - 1).bit_length() if len(rom) > 1 else 1
+    data_bits = byte_width * 8
+
+    with open(path, "w") as f:
+        f.write(f"module {mem_name}_rom (\n")
+        f.write(f"    input  [{addr_bits-1}:0] addr,\n")
+        f.write(f"    output [{data_bits-1}:0] data\n")
+        f.write(f");\n\n")
+
+        f.write(f"    reg [{data_bits-1}:0] mem [{len(rom)-1}:0];\n\n")
+        f.write(f"    initial begin\n")
+        for i, word in enumerate(rom):
+            f.write(f"        mem[{i}] = {data_bits}'h{word:0{byte_width*2}x};\n")
+        f.write(f"    end\n\n")
+
+        f.write(f"    assign data = mem[addr];\n\n")
+        f.write(f"endmodule\n")
+
+def split_rom(rom: list[int], split_width: int, byte_width: int) -> dict[int, list[int]]:
+    if split_width % 8 != 0:
+        raise ValueError("split_width must be a multiple of 8 (8, 16, 24, 32, ...)")
+
+    target_bytes = split_width // 8
+    if target_bytes > byte_width:
+        raise ValueError(f"Cannot split to {split_width} bits (ROM is only {byte_width*8} bits wide)")
+
+    split_roms = {}
+
+    for byte_idx in range(target_bytes):
+        split_roms[byte_idx] = []
+        for word in rom:
+            byte_val = (word >> (byte_idx * 8)) & 0xFF
+            split_roms[byte_idx].append(byte_val)
+
+    return split_roms
+
+def main():
+    parser_args = argparse.ArgumentParser(description="MDL Microcode Compiler")
+    parser_args.add_argument("input", help="Input MDL file")
+    parser_args.add_argument("output", help="Output file (base name)")
+    parser_args.add_argument("--format", choices=["bin", "hex", "hex-intel", "verilog", "verilog-mem"],
+                            default="bin", help="Output format (default: bin)")
+    parser_args.add_argument("--split", type=int,
+                            help="Split ROM to N bits per file (must be multiple of 8: 8, 16, 24, 32, ...)")
+    parser_args.add_argument("--verilog-name", default="rom", help="Verilog module name (for --format verilog)")
+
+    args = parser_args.parse_args()
+
+    if args.split and args.split % 8 != 0:
+        print(f"Error: --split must be a multiple of 8 (got {args.split})", file=sys.stderr)
+        sys.exit(1)
+
+    input_file, output_file = args.input, args.output
     parser = Parser(input_file)
 
     with open(input_file, encoding="utf-8") as f:
@@ -464,9 +609,39 @@ def main():
     if parser.errors or rom is None: die()
 
     byte_width = (parser.program.output_width + 7) // 8
-    with open(output_file, "wb") as f:
-        for word in rom:
-            f.write(word.to_bytes(byte_width, byteorder="little"))
+
+    if args.split:
+        split_roms = split_rom(rom, args.split, byte_width)
+        split_byte_width = args.split // 8
+
+        for idx, split_data in sorted(split_roms.items()):
+            base, ext = output_file.rsplit('.', 1) if '.' in output_file else (output_file, '')
+            out_path = f"{base}_{idx}.{ext}" if ext else f"{base}_{idx}"
+
+            if args.format == "bin":
+                with open(out_path, "wb") as f:
+                    for byte_val in split_data:
+                        f.write(bytes([byte_val]))
+            elif args.format == "hex":
+                save_hex_raw(split_data, out_path, 1)
+            elif args.format == "hex-intel":
+                save_hex_intel(split_data, out_path, 1)
+            elif args.format == "verilog-mem":
+                save_verilog_mem(split_data, out_path, 1, f"{args.verilog_name}_{idx}")
+            elif args.format == "verilog":
+                save_verilog_init(split_data, out_path, 1, f"{args.verilog_name}_{idx}")
+    else:
+        # Single output file
+        if args.format == "bin":
+            save_bin(rom, output_file, byte_width)
+        elif args.format == "hex":
+            save_hex_raw(rom, output_file, byte_width)
+        elif args.format == "hex-intel":
+            save_hex_intel(rom, output_file, byte_width)
+        elif args.format == "verilog-mem":
+            save_verilog_mem(rom, output_file, byte_width, args.verilog_name)
+        elif args.format == "verilog":
+            save_verilog_init(rom, output_file, byte_width, args.verilog_name)
 
 if __name__ == "__main__":
     main()

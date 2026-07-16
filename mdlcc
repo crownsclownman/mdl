@@ -199,12 +199,13 @@ class Parser:
         self.program.outputs[name] = OutputField(name=name, width=width)
 
     def parse_condition(self, cond_str: str, full_line: str, lineno: int) -> Condition:
+        cond_str = cond_str.split(';', 1)[0].strip()
         col = full_line.find(cond_str)
         invert = cond_str.startswith('!')
         s = cond_str[1:] if invert else cond_str
 
         for op in ['!=', '<=', '>=', '==', '=', '<', '>']:
-            for op in s:
+            if op in s:
                 fname, val_str = s.split(op, 1)
                 fname = fname.strip()
                 val_str = val_str.strip()
@@ -227,18 +228,28 @@ class Parser:
                 return Condition(field=fname, cond_type=cond_type, value=value)
 
         if '[' in s:
-            fname, b = s.split('[')
+            fname, rest = s.split('[', 1)
             fname = fname.strip()
+
             try:
-                bit = int(b.rstrip(']'))
+                bit = int(rest.split(']', 1)[0].strip(), 0)
             except ValueError:
                 self._err(self._loc(lineno, col, full_line), "Invalid bit index")
                 return Condition(field=fname)
-            return Condition(field=fname, cond_type=COND_BIT, bit=bit, invert=invert)
-        else:
-            fname = s.strip()
-            return Condition(field=fname, cond_type=COND_BIT, bit=0, invert=invert)
 
+            return Condition(
+                field=fname,
+                cond_type=COND_BIT,
+                bit=bit,
+                invert=invert,
+            )
+        fname = s.strip()
+        return Condition(
+            field=fname,
+            cond_type=COND_BIT,
+            bit=0,
+            invert=invert,
+        )
     def parse_instruction(self, line: str, lineno: int):
         if not line.strip():
             return

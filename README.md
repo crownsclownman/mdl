@@ -355,17 +355,6 @@ Split width must be a multiple of 8. Each chunk becomes a separate file: `rom_0.
 ### Prerequisites
 - Python 3.10+
 
-### Installation
-```bash
-chmod +x mdlcc
-./mdlcc input.mdl output.bin
-```
-
-Or:
-```bash
-python3 mdlcc input.mdl output.bin
-```
-
 ### Quick Examples
 
 **Basic binary output:**

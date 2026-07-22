@@ -1,0 +1,23 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Make executable
+        run: chmod +x mdlcc
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mdlcc
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,14 +1,3 @@
-# Neovim / Vim
-*.swp
-*.swo
-.vim/
-.nvim/
-session.vim
-
-# Прочее
-__pycache__/
-*.pyc
-.DS_Store
-
 push.sh
 release.sh
+
